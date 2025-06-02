@@ -1,6 +1,7 @@
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import fitz  # PyMuPDF
+import re
 
 ignore_phrases = [
     "Grand Polycoats Co.Pvt.Ltd.",
@@ -15,16 +16,16 @@ ignore_phrases = [
     "2/2"
 ]
 
+heading_keywords = [
+    "Description", "Recommended Use", "Physical Data",
+    "Application Data", "Notes", "Health & Safety",
+    "Limitation of Liability", "Application Method",
+    "Additional Information", "Surface Preparation"
+]
+
 def extract_text_with_styles(pdf_path):
     doc = fitz.open(pdf_path)
     content = []
-
-    heading_keywords = [
-        "Description", "Recommended Use", "Physical Data" ,
-        "Application Data", "Notes",
-        "Health & Safety", "Limitation of Liability", "Application Method",
-        "Additional Information"
-    ]
 
     for page in doc:
         blocks = page.get_text("dict")["blocks"]
@@ -36,12 +37,8 @@ def extract_text_with_styles(pdf_path):
 
             for line in block['lines']:
                 line_text = ' '.join(span['text'] for span in line['spans']).strip()
-                if not line_text:
+                if not line_text or any(phrase.lower() in line_text.lower() for phrase in ignore_phrases):
                     continue
-
-                # Check if line contains any ignored phrase (case-insensitive)
-                if any(phrase.lower() in line_text.lower() for phrase in ignore_phrases):
-                    continue  # Skip this line completely
 
                 span = line['spans'][0]
                 y_pos = block['bbox'][1]
@@ -49,8 +46,7 @@ def extract_text_with_styles(pdf_path):
                 font_name = span['font']
                 is_bold = "bold" in font_name.lower()
                 is_large = font_size > 12
-                is_manual_heading = any(k.lower() in line_text.lower() for k in heading_keywords)
-
+                is_manual_heading = any(k.lower() == line_text.strip().lower() for k in heading_keywords)
                 style = 'HEADING_1' if (is_manual_heading or is_large or is_bold) else 'NORMAL_TEXT'
 
                 lines.append({
@@ -59,10 +55,8 @@ def extract_text_with_styles(pdf_path):
                     'style': style
                 })
 
-        # Sort lines top to bottom
         lines.sort(key=lambda l: l['y'])
 
-        # Group into paragraphs
         paragraph = ""
         current_style = None
         previous_y = None
@@ -72,7 +66,7 @@ def extract_text_with_styles(pdf_path):
             text = line['text']
             style = line['style']
 
-            if current_style != style or (previous_y is not None and abs(y - previous_y) > 5):  # New paragraph
+            if current_style != style or (previous_y is not None and abs(y - previous_y) > 5):
                 if paragraph:
                     content.append({'text': paragraph.strip(), 'style': current_style})
                 paragraph = text
@@ -87,83 +81,44 @@ def extract_text_with_styles(pdf_path):
 
     return content
 
-# def insert_content_to_docs(service, document_id, content_lines):
-    requests = []
-    index = 1
-    for line in content_lines:
-        text = line["text"] + "\n"
-        length = len(text)
-        requests.append({
-            "insertText": {
-                "location": {"index": index},
-                "text": text
-            }
-        })
-        requests.append({
-            "updateParagraphStyle": {
-                "range": {
-                    "startIndex": index,
-                    "endIndex": index + length
-                },
-                "paragraphStyle": {
-                    "namedStyleType": line["style"]
-                },
-                "fields": "namedStyleType"
-            }
-        })
-        index += length
+def extract_table_blocks(content_lines):
+    table_data = []
+    pattern = re.compile(r"^([^:]+):\s*(.+)$")
+    buffer = []
 
-    service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
-def insert_content_to_docs(service, document_id, content_lines):
-    requests = []
-    index = 1
     for line in content_lines:
-        text = line["text"] + "\n"
-        length = len(text)
-        requests.append({
-            "insertText": {
-                "location": {"index": index},
-                "text": text
-            }
-        })
-        requests.append({
-            "updateParagraphStyle": {
-                "range": {
-                    "startIndex": index,
-                    "endIndex": index + length
-                },
-                "paragraphStyle": {
-                    "namedStyleType": line["style"]
-                },
-                "fields": "namedStyleType"
-            }
-        })
-        index += length
+        matches = pattern.findall(line["text"])
+        if matches:
+            for key, value in matches:
+                buffer.append((key.strip(), value.strip()))
+        else:
+            if buffer:
+                key, value = buffer[-1]
+                buffer[-1] = (key, value + " " + line["text"].strip())
 
-    service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+    return buffer
 
 def clear_doc_content(service, document_id):
     doc = service.documents().get(documentId=document_id).execute()
-    content = doc.get('body').get('content')
-
-    if not content or len(content) < 2:
+    content = doc.get('body').get('content', [])
+    if len(content) < 2:
         print("Document is empty or no content to delete.")
         return
 
     start_index = 1
     end_index = content[-1]['endIndex']
 
-    # Fetch the document text to check last char
-    text_content = ""
-    for element in content:
-        if 'paragraph' in element:
-            for elem in element['paragraph']['elements']:
-                if 'textRun' in elem:
-                    text_content += elem['textRun']['content']
+    # Check last character to adjust end_index
+    last_paragraph = content[-1].get('paragraph', {})
+    elements = last_paragraph.get('elements', [])
+    if elements and 'textRun' in elements[-1]:
+        text_content = elements[-1]['textRun']['content']
+        if text_content.endswith('\n'):
+            end_index -= 1
 
-    # If last character is newline, reduce end_index by 1
-    if text_content.endswith('\n'):
-        end_index -= 1
+    if end_index <= start_index:
+        print("No content to delete, delete range is empty.")
+        return
 
     requests = [
         {
@@ -177,80 +132,51 @@ def clear_doc_content(service, document_id):
     ]
 
     service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+    print(f"Deleted content from index {start_index} to {end_index}")
 
-def insert_text(service, document_id, text):
+
+def insert_table_from_lines(service, document_id, insert_index, table_data):
+    num_rows = len(table_data)
+    if num_rows == 0:
+        return
+    requests = [{"insertTable": {"rows": num_rows, "columns": 2, "location": {"index": insert_index}}}]
+    insert_offset = insert_index + 1
+    for key, value in table_data:
+        for cell_text in [key, value]:
+            requests.append({
+                "insertText": {
+                    "text": cell_text,
+                    "location": {"index": insert_offset}
+                }
+            })
+            insert_offset += len(cell_text)
+    service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+
+def get_doc_end_index(service, document_id):
+    doc = service.documents().get(documentId=document_id).execute()
+    content = doc.get('body').get('content', [])
+    return content[-1]['endIndex'] if content else 1
+
+def insert_content_to_docs(service, document_id, content_lines):
+    # Join all text with newlines
+    full_text = ""
+    for line in content_lines:
+        text = line["text"]
+        if line["style"] == "HEADING_1":
+            text = text.upper()
+        full_text += text + "\n"
+
     requests = [
         {
             "insertText": {
                 "location": {"index": 1},
-                "text": text
+                "text": full_text
             }
         }
     ]
-    service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
 
-def rewrite_doc_with_text(service, document_id, content_lines):
-    print("Clearing existing document content...")
-    clear_doc_content(service, document_id)
-
-    # Join all lines into one string, preserve line breaks
-    text = "\n".join(line['text'] for line in content_lines)
-
-    print("Inserting new text content...")
-    insert_text(service, document_id, text)
-    print("Done rewriting the document.")
-
-def insert_content_to_docs(service, document_id, content_lines):
-    requests = []
-    index = 1
-    for line in content_lines:
-        text = line["text"]
-        style = line["style"]
-
-        if style == "HEADING_1":
-            text = text.upper()  # Convert heading to uppercase
-
-        text += "\n"
-        length = len(text)
-
-        # Insert text
-        requests.append({
-            "insertText": {
-                "location": {"index": index},
-                "text": text
-            }
-        })
-
-        # Update paragraph style (e.g. HEADING_1 or NORMAL_TEXT)
-        requests.append({
-            "updateParagraphStyle": {
-                "range": {
-                    "startIndex": index,
-                    "endIndex": index + length
-                },
-                "paragraphStyle": {
-                    "namedStyleType": style
-                },
-                "fields": "namedStyleType"
-            }
-        })
-
-        # For headings, also make text bold
-        if style == "HEADING_1":
-            requests.append({
-                "updateTextStyle": {
-                    "range": {
-                        "startIndex": index,
-                        "endIndex": index + length - 1  # exclude newline from bold
-                    },
-                    "textStyle": {
-                        "bold": True
-                    },
-                    "fields": "bold"
-                }
-            })
-
-        index += length
+    # You can optionally add paragraph style update requests after insert if needed
+    # But be aware indexes must be correct — this is simpler for initial insert
 
     service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
 
@@ -259,18 +185,19 @@ def main():
     creds = Credentials.from_authorized_user_file('token.json', ['https://www.googleapis.com/auth/documents'])
     service = build('docs', 'v1', credentials=creds)
 
-    pdf_path = input("Enter path to PDF: ")
-    document_id = "18E7OyGAomyzKZ-xv1HN8NjRAK4NG-iOi6Y0ds2k5_iw"
+    pdf_path = input("Enter path to PDF: ").strip()
+    document_id = "1ZR4vqML6gDV3Pn8GIPfAkDVm-dSwqWhPzV627xD3RLQ"
 
+    print("Extracting content from PDF...")
     content_lines = extract_text_with_styles(pdf_path)
-    
-    # Either insert with styles (if you implement that function)
-    insert_content_to_docs(service, document_id, content_lines)
-    
-    # Or just rewrite plain text (recommended for simplicity)
-    # rewrite_doc_with_text(service, document_id, content_lines)
 
-    print("✅ PDF content successfully inserted into Google Doc.")
+    print("Clearing document content...")
+    clear_doc_content(service, document_id)
+
+    print("Inserting content into Google Doc...")
+    insert_content_to_docs(service, document_id, content_lines)
+
+    print("✅ Document updated successfully.")
 
 if __name__ == "__main__":
     main()
