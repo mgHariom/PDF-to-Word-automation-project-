@@ -186,7 +186,7 @@ def main():
     service = build('docs', 'v1', credentials=creds)
 
     pdf_path = input("Enter path to PDF: ").strip()
-    document_id = "1ZR4vqML6gDV3Pn8GIPfAkDVm-dSwqWhPzV627xD3RLQ"
+    document_id = "1NRBaUvQCRiNyQZNu6gtLKM3qbkDCSySCGak3OQkb2kY"
 
     print("Extracting content from PDF...")
     content_lines = extract_text_with_styles(pdf_path)
